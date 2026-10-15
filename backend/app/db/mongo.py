@@ -35,7 +35,9 @@ async def init_mongo_indexes():
     # Compound indexes for tenant isolation & performance
     await db.documents.create_index([("tenant_id", 1), ("_id", 1)])
     await db.conversations.create_index([("tenant_id", 1), ("_id", 1)])
+    await db.conversations.create_index([("tenant_id", 1), ("user_id", 1), ("_id", 1)])
     await db.messages.create_index([("tenant_id", 1), ("_id", 1)])
+    await db.messages.create_index([("tenant_id", 1), ("conversation_id", 1)])
     await db.users.create_index([("tenant_id", 1), ("email", 1)], unique=True)
     await db.tenants.create_index("slug", unique=True)
     await db.invitations.create_index([("tenant_id", 1), ("email", 1)])

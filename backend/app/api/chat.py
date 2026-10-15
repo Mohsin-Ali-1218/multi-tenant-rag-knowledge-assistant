@@ -17,6 +17,33 @@ async def search_kb_helper(tenant_id: str, query: str) -> List[Dict[str, Any]]:
     query_vector = get_embedding(query)
     return await search_tenant_docs(tenant_id=tenant_id, query_vector=query_vector, limit=4)
 
+async def get_verified_conversation(db, conversation_id: str, tenant_id: str, user_id: str) -> dict:
+    try:
+        conv_obj_id = ObjectId(conversation_id)
+    except InvalidId:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+
+    conv = await db.conversations.find_one({"_id": conv_obj_id})
+    if not conv:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+
+    if conv.get("tenant_id") != tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: Conversation belongs to a different tenant"
+        )
+
+    # Enforce conversation ownership alongside tenant_id unless explicitly authorized sharing exists
+    is_owner = str(conv.get("user_id")) == str(user_id)
+    is_shared = user_id in conv.get("shared_with", [])
+    if not (is_owner or is_shared):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: You do not have permission to access this conversation"
+        )
+
+    return conv
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(
     req: ChatRequest,
@@ -29,20 +56,12 @@ async def chat_endpoint(
 
     # Conversation management
     if req.conversation_id:
-        try:
-            conv_obj_id = ObjectId(req.conversation_id)
-        except InvalidId:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-
-        conv = await db.conversations.find_one({"_id": conv_obj_id})
-        if not conv:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-
-        if conv.get("tenant_id") != tenant_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Access forbidden: Conversation belongs to a different tenant"
-            )
+        conv = await get_verified_conversation(
+            db=db,
+            conversation_id=req.conversation_id,
+            tenant_id=tenant_id,
+            user_id=user_id
+        )
         conversation_id = str(conv["_id"])
     else:
         conv_doc = {
@@ -78,6 +97,7 @@ async def chat_endpoint(
     user_msg_doc = {
         "conversation_id": conversation_id,
         "tenant_id": tenant_id,
+        "user_id": user_id,
         "role": "user",
         "content": req.message,
         "sources": [],
@@ -89,6 +109,7 @@ async def chat_endpoint(
     asst_msg_doc = {
         "conversation_id": conversation_id,
         "tenant_id": tenant_id,
+        "user_id": user_id,
         "role": "assistant",
         "content": answer,
         "sources": sources,
@@ -109,22 +130,15 @@ async def get_conversation_messages(
     current_user: dict = Depends(get_current_user)
 ):
     tenant_id = current_user["tenant_id"]
+    user_id = current_user["user_id"]
     db = get_db()
 
-    try:
-        conv_obj_id = ObjectId(conversation_id)
-    except InvalidId:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-
-    conv = await db.conversations.find_one({"_id": conv_obj_id})
-    if not conv:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-
-    if conv.get("tenant_id") != tenant_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access forbidden: Conversation belongs to a different tenant"
-        )
+    await get_verified_conversation(
+        db=db,
+        conversation_id=conversation_id,
+        tenant_id=tenant_id,
+        user_id=user_id
+    )
 
     cursor = db.messages.find(
         {"tenant_id": tenant_id, "conversation_id": conversation_id}
@@ -148,3 +162,23 @@ async def get_conversation_messages(
         tenant_id=tenant_id,
         messages=messages
     )
+
+@router.delete("/conversations/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_conversation(
+    conversation_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    tenant_id = current_user["tenant_id"]
+    user_id = current_user["user_id"]
+    db = get_db()
+
+    conv = await get_verified_conversation(
+        db=db,
+        conversation_id=conversation_id,
+        tenant_id=tenant_id,
+        user_id=user_id
+    )
+
+    conv_obj_id = conv["_id"]
+    await db.conversations.delete_one({"_id": conv_obj_id})
+    await db.messages.delete_many({"tenant_id": tenant_id, "conversation_id": conversation_id})
