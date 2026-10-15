@@ -1,8 +1,8 @@
 import bcrypt
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import jwt
-from fastapi import HTTPException, Security, status
+from fastapi import Depends, HTTPException, Security, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from backend.app.config import settings
 
@@ -66,3 +66,15 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(
         "role": payload.get("role", "member"),
         "email": payload.get("email", "")
     }
+
+def require_roles(allowed_roles: List[str]):
+    async def dependency(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+        if current_user.get("role") not in allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Access forbidden: Insufficient permissions (requires one of: {', '.join(allowed_roles)})"
+            )
+        return current_user
+    return dependency
+
+require_admin = require_roles(["owner", "admin"])

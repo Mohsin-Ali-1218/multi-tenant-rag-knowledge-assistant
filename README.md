@@ -128,9 +128,16 @@ uv run uvicorn backend.main:app --reload --port 8000
 
 ## 🧪 Automated Integration Tests
 
-Run the full tenant isolation integration test suite proving the cross-tenant `403 Forbidden` security requirement:
+Run the full integration test suite covering tenant isolation, registration security, role authorization, and invitation lifecycle:
 ```bash
+# Run all integration tests
+uv run pytest -v
+
+# Run tenant isolation & 403 enforcement tests
 uv run pytest tests/test_tenant_isolation.py -v
+
+# Run registration vulnerability & invitation RBAC tests
+uv run pytest tests/test_auth_registration_security.py -v
 ```
 
 ---

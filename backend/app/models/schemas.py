@@ -1,17 +1,18 @@
 from typing import List, Optional
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 # --- Auth Schemas ---
 class RegisterRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     email: EmailStr
     password: str = Field(..., min_length=6)
-    tenant_name: str
-    tenant_slug: Optional[str] = None
-    role: Optional[str] = "admin"
+    tenant_name: str = Field(..., min_length=1)
 
 class LoginRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     email: EmailStr
     password: str
+    tenant_id: Optional[str] = None
 
 class TokenResponse(BaseModel):
     access_token: str
@@ -19,6 +20,37 @@ class TokenResponse(BaseModel):
     user_id: str
     tenant_id: str
     role: str
+
+# --- Invitation Schemas ---
+class CreateInvitationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    email: EmailStr
+    role: Optional[str] = Field("member", pattern="^(member|admin)$")
+
+class InvitationResponse(BaseModel):
+    id: str
+    tenant_id: str
+    email: str
+    role: str
+    invitation_token: str
+    expires_at: str
+    created_at: str
+
+class InvitationItemResponse(BaseModel):
+    id: str
+    tenant_id: str
+    email: str
+    role: str
+    status: str
+    created_at: str
+    expires_at: str
+    used_at: Optional[str] = None
+
+class AcceptInvitationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    invitation_token: str = Field(..., min_length=10)
+    email: EmailStr
+    password: str = Field(..., min_length=6)
 
 # --- Document Schemas ---
 class DocumentCreate(BaseModel):

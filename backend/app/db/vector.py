@@ -74,12 +74,21 @@ async def search_tenant_docs(
     if collection_name not in collection_names:
         return []
 
-    results = await client.search(
-        collection_name=collection_name,
-        query_vector=query_vector,
-        limit=limit,
-        with_payload=True
-    )
+    if hasattr(client, "query_points"):
+        response = await client.query_points(
+            collection_name=collection_name,
+            query=query_vector,
+            limit=limit,
+            with_payload=True
+        )
+        results = response.points
+    else:
+        results = await client.search(
+            collection_name=collection_name,
+            query_vector=query_vector,
+            limit=limit,
+            with_payload=True
+        )
 
     hits = []
     for hit in results:
