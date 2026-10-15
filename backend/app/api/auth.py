@@ -127,6 +127,33 @@ async def login(req: LoginRequest):
             detail="Invalid email, password, or tenant" if (req_tenant_id or req_tenant_slug) else "Invalid email or password"
         )
 
+    # Check if user account is disabled or inactive
+    is_disabled = (
+        user.get("disabled") is True
+        or user.get("is_active") is False
+        or str(user.get("status", "")).lower() in ["disabled", "inactive", "suspended"]
+    )
+    if is_disabled:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account is disabled"
+        )
+
+    # Check if tenant is disabled
+    try:
+        tenant_doc = await db.tenants.find_one({"_id": ObjectId(target_tenant_id)})
+        if tenant_doc and (
+            tenant_doc.get("disabled") is True
+            or tenant_doc.get("is_active") is False
+            or str(tenant_doc.get("status", "")).lower() in ["disabled", "inactive", "suspended"]
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Tenant account is disabled"
+            )
+    except InvalidId:
+        pass
+
     user_id = str(user["_id"])
     role = user.get("role", "member")
 

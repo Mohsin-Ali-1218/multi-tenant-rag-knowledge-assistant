@@ -2,9 +2,12 @@ import bcrypt
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any, List
 import jwt
+from bson import ObjectId
+from bson.errors import InvalidId
 from fastapi import Depends, HTTPException, Security, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from backend.app.config import settings
+from backend.app.db.mongo import get_db
 
 security = HTTPBearer()
 
@@ -59,12 +62,73 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Security(
             detail="Token missing required claims (user_id/tenant_id)",
             headers={"WWW-Authenticate": "Bearer"},
         )
-        
+
+    try:
+        user_obj_id = ObjectId(user_id)
+    except InvalidId:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid user identifier in token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    db = get_db()
+    user = await db.users.find_one({"_id": user_obj_id})
+    if not user or str(user.get("tenant_id")) != str(tenant_id):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found or tenant membership revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Check if user account is disabled or inactive
+    is_disabled = (
+        user.get("disabled") is True
+        or user.get("is_active") is False
+        or str(user.get("status", "")).lower() in ["disabled", "inactive", "suspended"]
+    )
+    if is_disabled:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account is disabled",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Verify tenant status
+    try:
+        tenant_obj_id = ObjectId(tenant_id)
+        tenant = await db.tenants.find_one({"_id": tenant_obj_id})
+        if not tenant:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Tenant not found or deleted",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if (
+            tenant.get("disabled") is True
+            or tenant.get("is_active") is False
+            or str(tenant.get("status", "")).lower() in ["disabled", "inactive", "suspended"]
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Tenant account is disabled",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    except InvalidId:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid tenant identifier in token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Fetch live role from database state rather than trusting potentially outdated JWT claim
+    current_role = user.get("role", "member")
+
     return {
-        "user_id": user_id,
-        "tenant_id": tenant_id,
-        "role": payload.get("role", "member"),
-        "email": payload.get("email", "")
+        "user_id": str(user["_id"]),
+        "tenant_id": str(user["tenant_id"]),
+        "role": current_role,
+        "email": user.get("email", payload.get("email", ""))
     }
 
 def require_roles(allowed_roles: List[str]):
