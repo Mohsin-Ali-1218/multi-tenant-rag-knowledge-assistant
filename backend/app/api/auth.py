@@ -6,7 +6,9 @@ from typing import List
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, status
-from backend.app.db.mongo import get_db
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError, OperationFailure, ConfigurationError, PyMongoError
+from backend.app.db.mongo import get_db, get_mongo_client
 from backend.app.models.schemas import (
     RegisterRequest,
     LoginRequest,
@@ -29,14 +31,6 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 async def register(req: RegisterRequest):
     db = get_db()
     email = req.email.strip().lower()
-
-    # Prevent duplicate user registration
-    existing_user = await db.users.find_one({"email": email})
-    if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="User with this email already exists"
-        )
 
     # Generate unique slug for tenant - new registration ALWAYS creates a new tenant
     base_slug = re.sub(r'[^a-z0-9]+', '-', req.tenant_name.lower()).strip('-') or "tenant"
@@ -83,30 +77,62 @@ async def register(req: RegisterRequest):
 async def login(req: LoginRequest):
     db = get_db()
     email = req.email.strip().lower()
-    query = {"email": email}
-    if req.tenant_id:
-        query["tenant_id"] = req.tenant_id
 
-    user = await db.users.find_one(query)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password"
-        )
+    target_tenant_id = None
+    req_tenant_slug = req.tenant_slug.strip().lower() if req.tenant_slug and req.tenant_slug.strip() else None
+    req_tenant_id = req.tenant_id.strip() if req.tenant_id and req.tenant_id.strip() else None
+
+    if req_tenant_slug:
+        tenant = await db.tenants.find_one({"slug": req_tenant_slug})
+        if not tenant:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email, password, or tenant"
+            )
+        target_tenant_id = str(tenant["_id"])
+        if req_tenant_id and req_tenant_id != target_tenant_id:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email, password, or tenant"
+            )
+    elif req_tenant_id:
+        target_tenant_id = req_tenant_id
+
+    if target_tenant_id:
+        user = await db.users.find_one({"email": email, "tenant_id": target_tenant_id})
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email, password, or tenant"
+            )
+    else:
+        # No tenant specified: find all tenant accounts for this email
+        matching_users = await db.users.find({"email": email}).to_list(length=10)
+        if not matching_users:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password"
+            )
+        if len(matching_users) > 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Multiple tenant accounts found for this email. Please specify 'tenant_id' or 'tenant_slug' to choose your tenant."
+            )
+        user = matching_users[0]
+        target_tenant_id = str(user["tenant_id"])
 
     if not verify_password(req.password, user["hashed_password"]):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password"
+            detail="Invalid email, password, or tenant" if (req_tenant_id or req_tenant_slug) else "Invalid email or password"
         )
 
     user_id = str(user["_id"])
-    tenant_id = str(user["tenant_id"])
     role = user.get("role", "member")
 
     token = create_access_token(data={
         "user_id": user_id,
-        "tenant_id": tenant_id,
+        "tenant_id": target_tenant_id,
         "role": role,
         "email": email
     })
@@ -115,7 +141,7 @@ async def login(req: LoginRequest):
         access_token=token,
         token_type="bearer",
         user_id=user_id,
-        tenant_id=tenant_id,
+        tenant_id=target_tenant_id,
         role=role
     )
 
@@ -270,14 +296,18 @@ async def accept_invitation(req: AcceptInvitationRequest):
     # Check if user already exists in this tenant
     existing_user = await db.users.find_one({"tenant_id": tenant_id, "email": req_email})
     if existing_user:
+        # Mark invitation as accepted/used so it does not incorrectly linger in pending
+        await db.invitations.update_one(
+            {"_id": inv["_id"], "status": "pending"},
+            {"$set": {"status": "accepted", "used_at": now.isoformat()}}
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="User already belongs to this tenant"
         )
 
-    # Role is strictly assigned from the invitation record - cannot be chosen by client
-    role = inv.get("role", "member")
     now_iso = now.isoformat()
+    role = inv.get("role", "member")
     hashed_pw = hash_password(req.password)
 
     user_doc = {
@@ -287,14 +317,115 @@ async def accept_invitation(req: AcceptInvitationRequest):
         "role": role,
         "created_at": now_iso
     }
-    user_res = await db.users.insert_one(user_doc)
-    user_id = str(user_res.inserted_id)
 
-    # Atomically mark invitation as accepted
-    await db.invitations.update_one(
-        {"_id": inv["_id"]},
-        {"$set": {"status": "accepted", "used_at": now_iso}}
-    )
+    # Attempt execution with MongoDB Multi-Document Transaction if supported by deployment (e.g. replica set)
+    client = get_mongo_client()
+    tx_supported = False
+    try:
+        async with client.start_session() as session:
+            try:
+                await session.start_transaction()
+                claimed_inv = await db.invitations.find_one_and_update(
+                    {
+                        "_id": inv["_id"],
+                        "status": "pending",
+                        "used_at": None
+                    },
+                    {
+                        "$set": {
+                            "status": "accepted",
+                            "used_at": now_iso
+                        }
+                    },
+                    return_document=ReturnDocument.AFTER,
+                    session=session
+                )
+                if not claimed_inv:
+                    await session.abort_transaction()
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Invitation has already been used or revoked"
+                    )
+
+                user_res = await db.users.insert_one(user_doc, session=session)
+                user_id = str(user_res.inserted_id)
+
+                await session.commit_transaction()
+                tx_supported = True
+            except (OperationFailure, ConfigurationError) as op_err:
+                await session.abort_transaction()
+                # Standalone mongod does not allow transactions (code 20)
+                if getattr(op_err, "code", None) == 20 or "replica set" in str(op_err).lower():
+                    tx_supported = False
+                else:
+                    raise
+            except DuplicateKeyError:
+                await session.abort_transaction()
+                await db.invitations.update_one(
+                    {"_id": inv["_id"], "status": "pending"},
+                    {"$set": {"status": "accepted", "used_at": now_iso}}
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="User already belongs to this tenant"
+                )
+    except HTTPException:
+        raise
+    except Exception as e:
+        if tx_supported:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Transaction failure during invitation acceptance: {str(e)}"
+            )
+
+    # Safe atomic claim with recovery compensation for standalone MongoDB deployments
+    if not tx_supported:
+        claimed_inv = await db.invitations.find_one_and_update(
+            {
+                "_id": inv["_id"],
+                "status": "pending",
+                "used_at": None
+            },
+            {
+                "$set": {
+                    "status": "accepted",
+                    "used_at": now_iso
+                }
+            },
+            return_document=ReturnDocument.AFTER
+        )
+        if not claimed_inv:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invitation has already been used or revoked"
+            )
+
+        try:
+            user_res = await db.users.insert_one(user_doc)
+            user_id = str(user_res.inserted_id)
+        except DuplicateKeyError:
+            # User already belongs to this tenant!
+            # The invitation is NOT restored to pending (doing so would incorrectly
+            # allow replaying/reusing an invitation for an already registered user).
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="User already belongs to this tenant"
+            )
+        except Exception as db_err:
+            # An unexpected database failure occurred during user creation.
+            # Safely revert the invitation to 'pending' so the user is NOT left with
+            # an orphan 'accepted' invitation without an associated user account.
+            try:
+                await db.invitations.update_one(
+                    {"_id": inv["_id"], "status": "accepted"},
+                    {"$set": {"status": "pending", "used_at": None}}
+                )
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Database error during user registration: {str(db_err)}"
+            )
 
     token = create_access_token(data={
         "user_id": user_id,

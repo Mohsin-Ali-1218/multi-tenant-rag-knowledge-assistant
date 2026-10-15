@@ -13,6 +13,7 @@ class LoginRequest(BaseModel):
     email: EmailStr
     password: str
     tenant_id: Optional[str] = None
+    tenant_slug: Optional[str] = None
 
 class TokenResponse(BaseModel):
     access_token: str
