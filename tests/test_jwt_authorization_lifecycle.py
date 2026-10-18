@@ -243,3 +243,40 @@ async def test_jwt_authorization_and_lifecycle_state():
             "role": "member"
         })
         assert owner_create.status_code == 201
+
+
+def test_production_configuration_rejects_insecure_secrets(monkeypatch):
+    """
+    Verify production configuration strictly rejects default/placeholder secrets
+    and enforces entropy requirements.
+    """
+    from backend.app.config import Settings
+
+    s = Settings()
+
+    # In production, default/placeholder secret must be rejected
+    monkeypatch.setenv("ENVIRONMENT", "production")
+    monkeypatch.setenv("JWT_SECRET", "replace_with_a_random_secret")
+    with pytest.raises(RuntimeError, match="Default or placeholder JWT_SECRET is prohibited"):
+        _ = s.JWT_SECRET
+
+    # In production, short secret (< 32 chars) must be rejected
+    monkeypatch.setenv("JWT_SECRET", "short_secret_12345")
+    with pytest.raises(RuntimeError, match="JWT_SECRET must be at least 32 characters"):
+        _ = s.JWT_SECRET
+
+    # In production, placeholder GEMINI_API_KEY must be rejected
+    monkeypatch.setenv("GEMINI_API_KEY", "your_gemini_api_key_here")
+    with pytest.raises(RuntimeError, match="Valid GEMINI_API_KEY must be configured"):
+        _ = s.GEMINI_API_KEY
+
+    # In production, empty GEMINI_API_KEY must be rejected
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    with pytest.raises(RuntimeError, match="Valid GEMINI_API_KEY must be configured"):
+        _ = s.GEMINI_API_KEY
+
+    # In production, valid 32+ char secret and key succeed
+    monkeypatch.setenv("JWT_SECRET", "a" * 32)
+    monkeypatch.setenv("GEMINI_API_KEY", "valid_api_key_sample")
+    assert s.JWT_SECRET == "a" * 32
+    assert s.GEMINI_API_KEY == "valid_api_key_sample"
