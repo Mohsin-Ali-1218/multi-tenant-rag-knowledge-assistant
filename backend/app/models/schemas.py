@@ -65,6 +65,8 @@ class DocumentResponse(BaseModel):
     raw_text: str
     chunk_count: int
     uploaded_at: str
+    filename: Optional[str] = None
+    file_type: Optional[str] = None
 
 # --- Chat & RAG Schemas ---
 class ChatRequest(BaseModel):

@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -13,9 +13,9 @@ from backend.app.services.llm import rewrite_query, run_rag_agent
 
 router = APIRouter(tags=["Chat"])
 
-async def search_kb_helper(tenant_id: str, query: str) -> List[Dict[str, Any]]:
+async def search_kb_helper(tenant_id: str, query: str, score_threshold: Optional[float] = None) -> List[Dict[str, Any]]:
     query_vector = get_embedding(query)
-    return await search_tenant_docs(tenant_id=tenant_id, query_vector=query_vector, limit=4)
+    return await search_tenant_docs(tenant_id=tenant_id, query_vector=query_vector, limit=4, score_threshold=score_threshold)
 
 async def get_verified_conversation(db, conversation_id: str, tenant_id: str, user_id: str) -> dict:
     try:

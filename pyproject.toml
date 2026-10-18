@@ -14,13 +14,14 @@ dependencies = [
     "pydantic>=2.10.0",
     "pydantic-settings>=2.7.0",
     "pyjwt>=2.10.0",
-    "passlib[bcrypt]>=1.7.4",
     "bcrypt>=4.0.0",
     "asteval>=1.0.0",
     "python-multipart>=0.0.18",
     "python-dotenv>=1.0.0",
     "email-validator>=2.0.0",
     "httpx>=0.28.0",
+    "pypdf>=5.0.0",
+    "python-docx>=1.1.0",
 ]
 
 [dependency-groups]
@@ -37,7 +38,10 @@ build-backend = "hatchling.build"
 packages = ["backend"]
 
 [tool.uv]
-index-strategy = "unsafe-best-match"
+override-dependencies = [
+    "torch",
+    "torchvision",
+]
 
 [[tool.uv.index]]
 name = "pypi"
@@ -47,6 +51,7 @@ default = true
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }

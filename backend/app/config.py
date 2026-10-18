@@ -68,4 +68,28 @@ class Settings:
     def EMBEDDING_MODEL_NAME(self) -> str:
         return os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
 
+    @property
+    def RAG_SIMILARITY_THRESHOLD(self) -> float:
+        return float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.50"))
+
+    @property
+    def MAX_UPLOAD_SIZE_MB(self) -> int:
+        return int(os.getenv("MAX_UPLOAD_SIZE_MB", "15"))
+
+    @property
+    def MAX_DOCUMENT_PAGES(self) -> int:
+        return int(os.getenv("MAX_DOCUMENT_PAGES", "100"))
+
+    @property
+    def MAX_DOCX_UNCOMPRESSED_SIZE_MB(self) -> int:
+        return int(os.getenv("MAX_DOCX_UNCOMPRESSED_SIZE_MB", "50"))
+
+    @property
+    def MAX_EXTRACTED_TEXT_LENGTH(self) -> int:
+        return int(os.getenv("MAX_EXTRACTED_TEXT_LENGTH", "1000000"))
+
+    @property
+    def MAX_DOCUMENT_CHUNKS(self) -> int:
+        return int(os.getenv("MAX_DOCUMENT_CHUNKS", "1000"))
+
 settings = Settings()
