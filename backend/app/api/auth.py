@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,10 @@ from backend.app.services.auth import (
     create_access_token,
     require_admin
 )
+
+logger = logging.getLogger("multitenant_rag.auth")
+
+INVITATION_ACCEPTANCE_ERROR_DETAIL = "Failed to process invitation acceptance due to an internal error."
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
@@ -348,10 +353,12 @@ async def accept_invitation(req: AcceptInvitationRequest):
     # Attempt execution with MongoDB Multi-Document Transaction if supported by deployment (e.g. replica set)
     client = get_mongo_client()
     tx_supported = False
+    tx_committed = False
     try:
         async with client.start_session() as session:
             try:
                 await session.start_transaction()
+                tx_supported = True
                 claimed_inv = await db.invitations.find_one_and_update(
                     {
                         "_id": inv["_id"],
@@ -378,16 +385,22 @@ async def accept_invitation(req: AcceptInvitationRequest):
                 user_id = str(user_res.inserted_id)
 
                 await session.commit_transaction()
-                tx_supported = True
+                tx_committed = True
             except (OperationFailure, ConfigurationError) as op_err:
-                await session.abort_transaction()
+                try:
+                    await session.abort_transaction()
+                except Exception:
+                    pass
                 # Standalone mongod does not allow transactions (code 20)
-                if getattr(op_err, "code", None) == 20 or "replica set" in str(op_err).lower():
+                if getattr(op_err, "code", None) == 20 or "replica set" in str(op_err).lower() or "standalone" in str(op_err).lower():
                     tx_supported = False
                 else:
                     raise
             except DuplicateKeyError:
-                await session.abort_transaction()
+                try:
+                    await session.abort_transaction()
+                except Exception:
+                    pass
                 await db.invitations.update_one(
                     {"_id": inv["_id"], "status": "pending"},
                     {"$set": {"status": "accepted", "used_at": now_iso}}
@@ -396,31 +409,54 @@ async def accept_invitation(req: AcceptInvitationRequest):
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="User already belongs to this tenant"
                 )
+            except HTTPException:
+                raise
+            except Exception:
+                try:
+                    await session.abort_transaction()
+                except Exception:
+                    pass
+                raise
     except HTTPException:
         raise
     except Exception as e:
         if tx_supported:
+            logger.error(
+                f"Transaction failure during invitation acceptance for tenant {tenant_id}, invitation {inv.get('_id')}, email {req_email}: {e}",
+                exc_info=True
+            )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Transaction failure during invitation acceptance: {str(e)}"
+                detail=INVITATION_ACCEPTANCE_ERROR_DETAIL
             )
 
     # Safe atomic claim with recovery compensation for standalone MongoDB deployments
-    if not tx_supported:
-        claimed_inv = await db.invitations.find_one_and_update(
-            {
-                "_id": inv["_id"],
-                "status": "pending",
-                "used_at": None
-            },
-            {
-                "$set": {
-                    "status": "accepted",
-                    "used_at": now_iso
-                }
-            },
-            return_document=ReturnDocument.AFTER
-        )
+    if not tx_committed:
+        try:
+            claimed_inv = await db.invitations.find_one_and_update(
+                {
+                    "_id": inv["_id"],
+                    "status": "pending",
+                    "used_at": None
+                },
+                {
+                    "$set": {
+                        "status": "accepted",
+                        "used_at": now_iso
+                    }
+                },
+                return_document=ReturnDocument.AFTER
+            )
+        except Exception as claim_err:
+            logger.error(
+                f"Database error during invitation claim for tenant {tenant_id}, invitation {inv.get('_id')}, email {req_email}: {claim_err}",
+                exc_info=True
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=INVITATION_ACCEPTANCE_ERROR_DETAIL
+            )
+
         if not claimed_inv:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -442,16 +478,23 @@ async def accept_invitation(req: AcceptInvitationRequest):
             # An unexpected database failure occurred during user creation.
             # Safely revert the invitation to 'pending' so the user is NOT left with
             # an orphan 'accepted' invitation without an associated user account.
+            logger.error(
+                f"Database error during user registration for tenant {tenant_id}, invitation {inv.get('_id')}, email {req_email}: {db_err}",
+                exc_info=True
+            )
             try:
                 await db.invitations.update_one(
                     {"_id": inv["_id"], "status": "accepted"},
                     {"$set": {"status": "pending", "used_at": None}}
                 )
-            except Exception:
-                pass
+            except Exception as rollback_err:
+                logger.critical(
+                    f"Compensating rollback failure for invitation {inv.get('_id')}, tenant {tenant_id}: {rollback_err}",
+                    exc_info=True
+                )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Database error during user registration: {str(db_err)}"
+                detail=INVITATION_ACCEPTANCE_ERROR_DETAIL
             )
 
     token = create_access_token(data={

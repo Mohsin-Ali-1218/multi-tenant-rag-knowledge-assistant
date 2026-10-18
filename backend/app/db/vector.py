@@ -1,9 +1,12 @@
 import uuid
 import logging
 from typing import Optional, List, Dict, Any
+from bson import ObjectId
+from bson.errors import InvalidId
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from backend.app.config import settings
+from backend.app.db.mongo import get_db
 
 logger = logging.getLogger("multitenant_rag.vector")
 
@@ -95,11 +98,73 @@ async def delete_document_chunks(tenant_id: str, doc_id: str):
         )
         raise
 
+async def validate_parent_documents(
+    tenant_id: str,
+    hits: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Batch-validates Qdrant document hits against MongoDB using the authenticated tenant ID.
+    Discards hits with missing, malformed, or cross-tenant parent document IDs.
+    Preserves scores, metadata, and retrieval order for valid hits.
+    Fails closed if MongoDB lookup fails (raises RuntimeError without exposing raw DB details).
+    """
+    if not hits:
+        return []
+
+    valid_obj_ids = []
+    for h in hits:
+        raw_id = h.get("document_id")
+        if not raw_id:
+            continue
+        try:
+            valid_obj_ids.append(ObjectId(str(raw_id)))
+        except (InvalidId, TypeError):
+            continue
+
+    if not valid_obj_ids:
+        logger.warning(
+            f"All {len(hits)} Qdrant hits for tenant {tenant_id} have missing or malformed document IDs. Discarding all."
+        )
+        return []
+
+    try:
+        db = get_db()
+        cursor = db.documents.find(
+            {
+                "_id": {"$in": valid_obj_ids},
+                "tenant_id": str(tenant_id),
+            },
+            {"_id": 1, "tenant_id": 1}
+        )
+        valid_tenant_doc_ids = set()
+        async for doc in cursor:
+            valid_tenant_doc_ids.add(str(doc["_id"]))
+    except Exception as db_err:
+        logger.error(
+            f"MongoDB validation query failed while verifying document hits for tenant {tenant_id}: {db_err}",
+            exc_info=True
+        )
+        raise RuntimeError("Database validation failed for document hits") from db_err
+
+    validated_hits = []
+    for h in hits:
+        raw_id = str(h.get("document_id")) if h.get("document_id") is not None else ""
+        if raw_id in valid_tenant_doc_ids:
+            validated_hits.append(h)
+        else:
+            logger.warning(
+                f"Discarding orphaned or unauthorized vector hit for tenant {tenant_id}: "
+                f"document_id={h.get('document_id')}, title={h.get('document_title')}"
+            )
+
+    return validated_hits
+
 async def search_tenant_docs(
     tenant_id: str,
     query_vector: List[float],
     limit: int = 4,
-    score_threshold: Optional[float] = None
+    score_threshold: Optional[float] = None,
+    validate_parent_docs: bool = True,
 ) -> List[Dict[str, Any]]:
     client = get_qdrant_client()
     collection_name = get_tenant_collection_name(tenant_id)
@@ -142,4 +207,8 @@ async def search_tenant_docs(
                 "score": score,
                 "chunk_index": hit.payload.get("chunk_index"),
             })
+
+    if validate_parent_docs:
+        return await validate_parent_documents(tenant_id=tenant_id, hits=hits)
+
     return hits

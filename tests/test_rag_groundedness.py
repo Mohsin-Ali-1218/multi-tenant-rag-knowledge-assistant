@@ -1,7 +1,28 @@
 import uuid
+from unittest.mock import MagicMock
 import pytest
 from httpx import AsyncClient, ASGITransport
 from backend.main import app
+
+@pytest.fixture(autouse=True)
+def mock_llm_calls(monkeypatch):
+    mock_client = MagicMock()
+
+    def fake_generate_content(*args, **kwargs):
+        contents = kwargs.get("contents") or (args[0] if args else "")
+        contents_str = str(contents)
+        if "Strict Grounding Rules:" in contents_str:
+            if "Remote Work and Equipment Policy" in contents_str or "$500" in contents_str:
+                return MagicMock(text="Employees working remotely are entitled to a $500 home office equipment reimbursement.", function_calls=None)
+            if "Patient Health Data Encryption Standard" in contents_str or "AES-256" in contents_str:
+                return MagicMock(text="All patient medical records must be encrypted using AES-256 standard encryption algorithms.", function_calls=None)
+            return MagicMock(text="I couldn't find this information in your documents.", function_calls=None)
+        if contents_str.startswith("User Query:"):
+            return MagicMock(text="Looking up knowledge base.", function_calls=None)
+        return MagicMock(text="Grounded answer.", function_calls=None)
+
+    mock_client.models.generate_content.side_effect = fake_generate_content
+    monkeypatch.setattr("backend.app.services.llm.get_genai_client", lambda: mock_client)
 
 @pytest.mark.asyncio
 async def test_rag_grounded_answer_and_relevance():

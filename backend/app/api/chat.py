@@ -83,15 +83,26 @@ async def chat_endpoint(
     ]
 
     # Step 1: Query rewriting
-    rewritten_q = await rewrite_query(history_messages, req.message)
+    rewrite_res = await rewrite_query(history_messages, req.message)
+    if isinstance(rewrite_res, tuple):
+        rewritten_q, rewrite_degraded = rewrite_res
+    else:
+        rewritten_q, rewrite_degraded = rewrite_res, False
 
     # Step 2 & 3: Agent router & Tool execution & Synthesis
-    answer, sources = await run_rag_agent(
+    agent_res = await run_rag_agent(
         tenant_id=tenant_id,
         rewritten_query=rewritten_q,
         search_kb_func=search_kb_helper,
         calculate_func=safe_calculate
     )
+    if len(agent_res) == 3:
+        answer, sources, agent_degraded = agent_res
+    else:
+        answer, sources = agent_res
+        agent_degraded = False
+
+    is_degraded = bool(rewrite_degraded or agent_degraded)
 
     # Save user message
     user_msg_doc = {
@@ -101,9 +112,12 @@ async def chat_endpoint(
         "role": "user",
         "content": req.message,
         "sources": [],
+        "is_degraded": False,
         "created_at": now_iso
     }
     await db.messages.insert_one(user_msg_doc)
+
+    source_items = [SourceItem(**s) for s in sources]
 
     # Save assistant message
     asst_msg_doc = {
@@ -112,16 +126,17 @@ async def chat_endpoint(
         "user_id": user_id,
         "role": "assistant",
         "content": answer,
-        "sources": sources,
+        "sources": [s.model_dump() for s in source_items],
+        "is_degraded": is_degraded,
         "created_at": datetime.now(timezone.utc).isoformat()
     }
     await db.messages.insert_one(asst_msg_doc)
 
-    source_items = [SourceItem(**s) for s in sources]
     return ChatResponse(
         conversation_id=conversation_id,
         answer=answer,
-        sources=source_items
+        sources=source_items,
+        is_degraded=is_degraded
     )
 
 @router.get("/conversations/{conversation_id}/messages", response_model=ConversationMessagesResponse)
@@ -154,7 +169,8 @@ async def get_conversation_messages(
             role=msg["role"],
             content=msg["content"],
             sources=sources,
-            created_at=msg["created_at"]
+            created_at=msg["created_at"],
+            is_degraded=bool(msg.get("is_degraded", False))
         ))
 
     return ConversationMessagesResponse(

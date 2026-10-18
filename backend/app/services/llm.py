@@ -10,14 +10,18 @@ logger = logging.getLogger("multitenant_rag.llm")
 def get_genai_client() -> genai.Client:
     return genai.Client(api_key=settings.GEMINI_API_KEY)
 
-async def rewrite_query(chat_history: List[Dict[str, str]], latest_message: str) -> str:
+async def rewrite_query(chat_history: List[Dict[str, str]], latest_message: str) -> Tuple[str, bool]:
     """
     Rewrites the latest user message into a standalone query using conversation history.
-    Logs both original and rewritten query.
+    Returns (rewritten_query, is_degraded).
     """
-    if not chat_history or not settings.GEMINI_API_KEY:
+    if not chat_history:
         logger.info(f"Query rewrite [Fast path] Original: '{latest_message}' | Rewritten: '{latest_message}'")
-        return latest_message
+        return latest_message, False
+
+    if not settings.GEMINI_API_KEY:
+        logger.warning("No GEMINI_API_KEY configured for query rewrite. Conversational context may be lost.")
+        return latest_message, True
 
     history_str = "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in chat_history])
     prompt = f"""Given the following conversation history and a follow-up user message, rewrite the follow-up message into a self-contained, standalone question or request that includes all necessary context from history.
@@ -47,10 +51,10 @@ Rules:
         )
         rewritten = response.text.strip() if response.text else latest_message
         logger.info(f"Query rewrite | Original: '{latest_message}' | Rewritten: '{rewritten}'")
-        return rewritten
+        return rewritten, False
     except Exception as e:
-        logger.warning(f"Query rewriting failed with error: {e}. Falling back to original message.")
-        return latest_message
+        logger.warning(f"Query rewriting failed with error: {e}. Falling back to original message.", exc_info=True)
+        return latest_message, True
 
 tool_search_kb = types.FunctionDeclaration(
     name="search_knowledge_base",
@@ -85,18 +89,37 @@ tool_calculate = types.FunctionDeclaration(
 agent_tools = types.Tool(function_declarations=[tool_search_kb, tool_calculate])
 
 GROUNDED_REJECTION_MESSAGE = "I couldn't find this information in your documents."
+TEMPORARILY_UNAVAILABLE_MESSAGE = "Answer generation is temporarily unavailable. Please try again later."
 
 def deduplicate_sources(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     unique_sources = []
     seen = set()
     for src in sources:
-        key = (src.get("document_title"), src.get("chunk_text"))
+        raw_page = src.get("page_number")
+        page_num = int(raw_page) if raw_page is not None else None
+        raw_fn = src.get("filename")
+        filename = str(raw_fn) if raw_fn is not None else None
+        doc_title = src.get("document_title")
+        chunk_text = src.get("chunk_text")
+
+        doc_id = src.get("document_id")
+        chunk_idx = src.get("chunk_index")
+
+        if doc_id is not None:
+            # Primary identity based on document and chunk identifier
+            key = ("id", str(doc_id), chunk_idx if chunk_idx is not None else (chunk_text, page_num))
+        else:
+            # Fallback key for legacy sources without identifiers: includes filename, page_number, title, and chunk_text
+            key = ("legacy", filename, page_num, doc_title, chunk_text)
+
         if key not in seen:
             seen.add(key)
             unique_sources.append({
-                "document_title": src.get("document_title"),
-                "chunk_text": src.get("chunk_text"),
-                "score": float(src.get("score", 0.0))
+                "document_title": doc_title,
+                "chunk_text": chunk_text,
+                "score": float(src.get("score", 0.0)),
+                "filename": filename,
+                "page_number": page_num,
             })
     return unique_sources
 
@@ -105,43 +128,21 @@ async def run_rag_agent(
     rewritten_query: str,
     search_kb_func: Any,
     calculate_func: Any,
-) -> Tuple[str, List[Dict[str, Any]]]:
+) -> Tuple[str, List[Dict[str, Any]], bool]:
     """
     Agent router function that:
     1. Asks Gemini which tool(s) to run (search_knowledge_base, calculate, or direct answer).
     2. Executes requested tools (can call both search & calc in one turn).
     3. Synthesizes final response with cited sources, strictly grounded in retrieved documents.
     4. Rejects unsupported or irrelevant questions with GROUNDED_REJECTION_MESSAGE and empty sources.
+    5. Returns (answer, sources, is_degraded).
     """
     sources: List[Dict[str, Any]] = []
     tool_results: List[str] = []
 
     if not settings.GEMINI_API_KEY:
-        logger.info("No GEMINI_API_KEY configured. Executing direct RAG retrieval & tool processing.")
-        
-        calc_result_msg = ""
-        import re
-        math_match = re.search(r'([\d\.]+\s*[\+\-\*/]\s*[\d\.]+)', rewritten_query)
-        is_calc_query = bool(math_match and any(k in rewritten_query.lower() for k in ["calculate", "math", "sum", "%", "+", "-", "*", "/", "refund", "fee", "penalty"]))
-        if is_calc_query and math_match:
-            expr = math_match.group(1)
-            calc_val = calculate_func(expr)
-            calc_result_msg = f"Calculated result for ({expr}): {calc_val}"
-
-        kb_hits = await search_kb_func(tenant_id, rewritten_query)
-
-        if not kb_hits:
-            if calc_result_msg:
-                return calc_result_msg, []
-            return GROUNDED_REJECTION_MESSAGE, []
-
-        sources.extend(kb_hits)
-        doc_context = "\n\n".join([f"[{h['document_title']}]\n{h['chunk_text']}" for h in kb_hits])
-        answer = f"Based on knowledge base documents:\n{doc_context}"
-        if calc_result_msg:
-            answer += f"\n\n{calc_result_msg}"
-
-        return answer, deduplicate_sources(sources)
+        logger.warning("No GEMINI_API_KEY configured. Answer generation unavailable.")
+        return TEMPORARILY_UNAVAILABLE_MESSAGE, [], True
 
     try:
         client = get_genai_client()
@@ -232,37 +233,15 @@ Please provide a clear, helpful response strictly adhering to the rules above.
             ]
             answer_lower = answer.lower()
             if any(ind in answer_lower for ind in rejection_indicators):
-                return GROUNDED_REJECTION_MESSAGE, []
+                return GROUNDED_REJECTION_MESSAGE, [], False
 
-            return answer, deduplicate_sources(sources)
+            return answer, deduplicate_sources(sources), False
         else:
             calc_results = [r for r in tool_results if "Tool 'calculate'" in r]
             if calc_results:
-                return "\n\n".join(calc_results), []
-            return GROUNDED_REJECTION_MESSAGE, []
+                return "\n\n".join(calc_results), [], False
+            return GROUNDED_REJECTION_MESSAGE, [], False
 
     except Exception as e:
-        logger.error(f"Agent execution failed with error: {e}. Executing deterministic fallback.", exc_info=True)
-        kb_hits = await search_kb_func(tenant_id, rewritten_query)
-
-        calc_result_msg = ""
-        import re
-        math_match = re.search(r'([\d\.]+\s*[\+\-\*/]\s*[\d\.]+)', rewritten_query)
-        is_calc_query = bool(math_match and any(k in rewritten_query.lower() for k in ["calculate", "math", "sum", "%", "+", "-", "*", "/", "refund", "fee", "penalty"]))
-        if is_calc_query and math_match:
-            expr = math_match.group(1)
-            calc_val = calculate_func(expr)
-            calc_result_msg = f"Calculated result for ({expr}): {calc_val}"
-
-        if not kb_hits:
-            if calc_result_msg:
-                return calc_result_msg, []
-            return GROUNDED_REJECTION_MESSAGE, []
-
-        sources.extend(kb_hits)
-        doc_context = "\n\n".join([f"[{h['document_title']}]\n{h['chunk_text']}" for h in kb_hits])
-        answer = f"Based on knowledge base documents:\n{doc_context}"
-        if calc_result_msg:
-            answer += f"\n\n{calc_result_msg}"
-
-        return answer, deduplicate_sources(sources)
+        logger.error(f"Agent execution failed with error: {e}. Answer generation unavailable.", exc_info=True)
+        return TEMPORARILY_UNAVAILABLE_MESSAGE, [], True

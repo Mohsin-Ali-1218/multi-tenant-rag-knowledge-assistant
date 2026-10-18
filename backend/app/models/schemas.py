@@ -74,14 +74,18 @@ class ChatRequest(BaseModel):
     message: str
 
 class SourceItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     document_title: str
     chunk_text: str
     score: float = 0.0
+    filename: Optional[str] = None
+    page_number: Optional[int] = None
 
 class ChatResponse(BaseModel):
     conversation_id: str
     answer: str
     sources: List[SourceItem]
+    is_degraded: bool = False
 
 class MessageItem(BaseModel):
     id: str
@@ -91,6 +95,7 @@ class MessageItem(BaseModel):
     content: str
     sources: List[SourceItem] = []
     created_at: str
+    is_degraded: bool = False
 
 class ConversationMessagesResponse(BaseModel):
     conversation_id: str
