@@ -58,3 +58,7 @@ coverage.xml
 .DS_Store
 Thumbs.db
 *.log
+
+api_config.txt
+handbook.pdf
+documents/
